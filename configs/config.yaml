@@ -1,0 +1,119 @@
+workload:
+  n_queries: 150000
+  drift_enabled: 1
+  phases:
+    - name: steady
+      length: 10000
+      mix:
+        - 0.7
+        - 0.2
+        - 0.1
+      cost_scale: 1.0
+      label_ru: Стабильный режим
+    - name: insert_burst
+      length: 15000
+      mix:
+        - 0.92
+        - 0.05
+        - 0.03
+      cost_scale: 1.0
+      label_ru: Всплеск вставок
+    - name: analytic_saturation
+      length: 10000
+      mix:
+        - 0.4
+        - 0.55
+        - 0.05
+      cost_scale: 1.0
+      label_ru: Насыщение аналитикой
+    - name: scale_shift
+      length: 15000
+      mix:
+        - 0.55
+        - 0.3
+        - 0.15
+      cost_scale: 3.0
+      label_ru: Рост масштаба данных
+offline:
+  n_offline_queries: 1000
+nodes:
+  n_row_nodes: 6
+  n_col_nodes: 4
+  row_service_rate: 0.3
+  col_service_rate: 0.25
+  row_rtt_ms: 0.3
+  col_rtt_ms: 2.0
+  load_scales_with_cost: 1
+  cost_load_reference: 5.0
+  admission_control_enabled: 1
+  max_queue_row: 10.0
+  max_queue_col: 10.0
+  reject_timeout_ms: 600.0
+  admission_reroute_penalty_ms: 8.0
+degradation:
+  enabled: true
+  engine: col
+  node_idx: 0
+  start_query: 10000
+  end_query: 50000
+  health_factor: 5.0
+  is_down: false
+  ramp_queries: 20000
+  extra:
+    - engine: row
+      node_idx: 1
+      start_query: 135000
+      end_query: 150000
+      health_factor: 4.0
+      is_down: false
+      ramp_queries: 7500
+dqn:
+  gamma: 0.9
+  lr: 0.001
+  eps_base: 0.03
+  eps_start: 0.6
+  eps_decay_steps: 8000
+  eps_drift: 0.15
+  target_sync_every: 100
+  pretrain_enabled: 1
+  pretrain_grad_steps: 20
+  buffer_size: 20000
+  batch_size: 256
+  hidden_size: 64
+  n_hidden_layers: 2
+  safety_enabled: 1
+  drift_exploration_enabled: 1
+  grad_steps_per_update: 10
+  train_interval: 5
+  per_alpha: 0.6
+  per_beta_start: 0.4
+  per_beta_frames: 20000
+  per_eps: 0.001
+bandit:
+  alpha: 1.0
+sla_ms: 200
+n_runs: 30
+seed0: 1000
+reward:
+  imbalance_weight: 1.0
+  congestion_weight: 0.6
+  sla_violation_weight: 0.5
+  failover_weight: 1.0
+plots:
+  subsets:
+    all:
+      - round_robin
+      - hash
+      - cost_threshold
+      - gbm_static
+      - bandit_lints
+      - rl_dqn
+    stable_only:
+      - round_robin
+      - hash
+      - rl_dqn
+    heuristics_vs_rl:
+      - cost_threshold
+      - gbm_static
+      - bandit_lints
+      - rl_dqn
