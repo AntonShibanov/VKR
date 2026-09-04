@@ -1,8 +1,6 @@
 """
-Визуализация результатов эксперимента: PNG-графики в results/figures/.
-Стилистика графиков приведена в соответствие с принятой в проекте нотацией:
-фиксированный словарь COLORS на стратегию, sns.boxplot для разброса метрик,
-прямой plt.bar с x_pos для сравнений с ДИ, единый rotation=45 для подписей осей.
+Построение всех PNG-графиков результатов эксперимента с поддержкой
+фильтрации по подмножествам стратегий (plots.subsets в конфиге).
 """
 import os
 import numpy as np
@@ -13,134 +11,102 @@ import matplotlib.patches as mpatches
 import yaml
 from src.workload import DEFAULT_PHASES
 
-OUTPUT_DIR = "results/figures"
-DPI = 300  # выше, чем в референсном примере (150), т.к. ранее было явное требование на повышенную чёткость
+OUTPUT_DIR = "results/figures"                                    # папка, куда сохраняются все графики
+DPI = 300                                                           # разрешение сохраняемых изображений
 
-METHOD_LABELS = {
+METHOD_LABELS = {                                                    # человекочитаемые названия методов для осей/легенд
     "round_robin": "Round-Robin", "hash": "Hash", "cost_threshold": "Cost-threshold",
     "gbm_static": "GBM (static)", "bandit_lints": "Bandit (LinTS)", "rl_dqn": "RL (DQN)",
 }
-_METHOD_ORDER = list(METHOD_LABELS)                 # ключи method, как в CSV
-STRATEGIES = [METHOD_LABELS[m] for m in _METHOD_ORDER] # человекочитаемые имена для осей/легенд
-COLORS = dict(zip(STRATEGIES, sns.color_palette("tab10", len(STRATEGIES))))  # фиксированный цвет на стратегию
+_METHOD_ORDER = list(METHOD_LABELS)                                    # порядок ключей method (как в CSV)
+STRATEGIES = [METHOD_LABELS[m] for m in _METHOD_ORDER]                  # список человекочитаемых имён в этом же порядке
+COLORS = dict(zip(STRATEGIES, sns.color_palette("tab10", len(STRATEGIES))))  # фиксированный цвет на каждую стратегию
 
-# Минимальная доля длины эпизода, которую должна занимать зона фазы, чтобы её код-подпись
-# рисовалась на графике — доп. защита от наложения даже коротких кодов при очень частых фазах.
-MIN_PHASE_LABEL_FRACTION = 0.02
+MIN_PHASE_LABEL_FRACTION = 0.02                                          # минимальная доля эпизода, чтобы подпись фазы рисовалась
 
 
 def _resolve_methods(methods):
-    """methods — список ключей method (как в CSV/METHOD_LABELS), либо None/[] (= все стратегии).
-    Неизвестные ключи отбрасываются с предупреждением — типичная причина: опечатка в
-    configs/config.yaml -> plotting.method_sets."""
+    """Проверить и нормализовать список ключей методов; None/[] означает "все методы"."""
     if not methods:
         return list(_METHOD_ORDER)
-    resolved = [m for m in methods if m in METHOD_LABELS]
-    unknown = [m for m in methods if m not in METHOD_LABELS]
+    resolved = [m for m in methods if m in METHOD_LABELS]                     # оставляем только известные методы
+    unknown = [m for m in methods if m not in METHOD_LABELS]                    # находим неизвестные (опечатки в конфиге)
     if unknown:
         print(f"[make_plots] Предупреждение: неизвестные методы в plotting.method_sets: {unknown} — пропущены")
-    return resolved or list(_METHOD_ORDER)
+    return resolved or list(_METHOD_ORDER)                                        # если список пуст — возвращаем все методы
 
 
 def _filename(base, suffix):
-    """base.png для набора 'all' (или если суффикс не задан); иначе base__suffix.png —
-    чтобы разные отфильтрованные варианты графика не перезатирали друг друга на диске."""
+    """Сформировать имя файла графика с учётом суффикса подмножества."""
     return f"{base}.png" if not suffix or suffix == "all" else f"{base}__{suffix}.png"
 
 
 def _build_phase_style(cfg):
-    """
-    Строит стили периодов дрейфа из cfg['workload']['phases'] (или DEFAULT_PHASES).
-    Возвращает три словаря {имя_фазы: ...}:
-      - codes       — короткий код для отображения НА графике (Тип 1, Тип 2, ...);
-      - colors      — цвет зоны;
-      - descriptions — полное русское название для ОТДЕЛЬНОЙ легенды под графиком.
-
-    Раньше на графике рисовались полные названия ("Насыщение аналитикой" и т.п.) прямо
-    внутри области построения — при большом числе фаз или их малой продолжительности
-    эти подписи накладывались друг на друга. Теперь на графике — только короткий код,
-    а расшифровка кодов выносится в отдельную легенду (см. _add_phase_code_legend).
-    """
-    phases_cfg = cfg.get("workload", {}).get("phases") or DEFAULT_PHASES
-    palette = sns.color_palette("Set2", len(phases_cfg))
-    codes = {p["name"]: f"Тип {i + 1}" for i, p in enumerate(phases_cfg)}
-    descriptions = {p["name"]: p.get("label_ru", p["name"]) for p in phases_cfg}
-    colors = {p["name"]: palette[i] for i, p in enumerate(phases_cfg)}
+    """Построить короткие коды, цвета и полные описания для всех фаз дрейфа нагрузки."""
+    phases_cfg = cfg.get("workload", {}).get("phases") or DEFAULT_PHASES         # берём фазы из конфига либо дефолт
+    palette = sns.color_palette("Set2", len(phases_cfg))                          # уникальный цвет на каждую фазу
+    codes = {p["name"]: f"Тип {i + 1}" for i, p in enumerate(phases_cfg)}           # короткий код "Тип N" для отображения на графике
+    descriptions = {p["name"]: p.get("label_ru", p["name"]) for p in phases_cfg}     # полное русское название для легенды
+    colors = {p["name"]: palette[i] for i, p in enumerate(phases_cfg)}                # цвет каждой фазы
     return codes, colors, descriptions
 
 
 def _annotate_phase_zones(ax, phases, phase_codes, phase_colors):
-    """Закрасить фон графика по стадиям нагрузки и подписать их КОРОТКИМИ кодами (Тип 1,
-    Тип 2, ...) сверху; пунктирные вертикальные линии отмечают точные границы смены
-    стадии. Расшифровка кодов даётся отдельной легендой под графиком, см.
-    _add_phase_code_legend — это устраняет наложение длинных названий друг на друга.
-
-    Подпись фазы рисуется только если её зона занимает не менее MIN_PHASE_LABEL_FRACTION
-    от длины эпизода — иначе при большом числе коротких фаз подписи накладываются друг на
-    друга по горизонтали."""
-    change_points = np.where(phases[1:] != phases[:-1])[0] + 1
-    boundaries = [0] + list(change_points) + [len(phases)]
-    total_len = len(phases)
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        phase = phases[start]
-        ax.axvspan(start, end, color=phase_colors.get(phase, "#EEEEEE"), alpha=0.18, zorder=0)
-        if (end - start) / total_len >= MIN_PHASE_LABEL_FRACTION:
-            mid = (start + end) / 2
+    """Закрасить фон графика по фазам и подписать их короткими кодами сверху."""
+    change_points = np.where(phases[1:] != phases[:-1])[0] + 1                     # индексы, где фаза меняется
+    boundaries = [0] + list(change_points) + [len(phases)]                            # границы всех зон (включая начало/конец)
+    total_len = len(phases)                                                             # общая длина эпизода
+    for start, end in zip(boundaries[:-1], boundaries[1:]):                                # для каждой непрерывной зоны фазы
+        phase = phases[start]                                                                # имя фазы в этой зоне
+        ax.axvspan(start, end, color=phase_colors.get(phase, "#EEEEEE"), alpha=0.18, zorder=0)  # закрашиваем фон
+        if (end - start) / total_len >= MIN_PHASE_LABEL_FRACTION:                              # если зона достаточно длинная
+            mid = (start + end) / 2                                                              # середина зоны для размещения подписи
             ax.text(mid, 1.02, phase_codes.get(phase, phase), transform=ax.get_xaxis_transform(),
-                    ha="center", va="bottom", fontsize=8)
-    for cp in change_points:
-        ax.axvline(cp, color="grey", ls="--", lw=0.7, zorder=1)
+                    ha="center", va="bottom", fontsize=8)                                          # подпись коротким кодом сверху графика
+    for cp in change_points:                                                                          # для каждой границы смены фазы
+        ax.axvline(cp, color="grey", ls="--", lw=0.7, zorder=1)                                          # пунктирная вертикальная линия
 
 
 def _add_phase_code_legend(ax, phase_codes, phase_descriptions, phase_colors):
-    """
-    Отдельная легенда «код -> полное название периода дрейфа», размещённая ПОД графиком
-    (за пределами области построения), чтобы не перекрывать ни легенду стратегий, ни
-    заголовок. Вызывается ПОСЛЕ того, как легенда стратегий уже создана и закреплена на
-    графике через ax.add_artist(...) — иначе повторный вызов ax.legend() удалит первую
-    легенду с осей.
-    """
+    """Отдельная легенда, расшифровывающая короткие коды фаз, размещённая под графиком."""
     handles = [mpatches.Patch(facecolor=phase_colors[name], alpha=0.5,
                                label=f"{phase_codes[name]} — {phase_descriptions[name]}")
-               for name in phase_codes]
+               for name in phase_codes]                                                                    # заплатка на каждую фазу
     ax.legend(handles=handles, title="Периоды нагрузки", loc="upper center",
               bbox_to_anchor=(0.5, -0.14), ncol=min(len(handles), 4), fontsize=8,
-              title_fontsize=9, frameon=True)
+              title_fontsize=9, frameon=True)                                                                # рисуем легенду под графиком
 
 
 def _with_strategy_column(df):
-    """Добавить колонку strategy с человекочитаемым именем метода (для группировки и цвета)."""
+    """Добавить в датафрейм колонку strategy с человекочитаемым именем метода."""
     df = df.copy()
     df["strategy"] = df["method"].map(METHOD_LABELS)
     return df
 
 
 def _ci95(x):
+    """95%-й доверительный интервал для среднего (нормальная аппроксимация)."""
     return 1.96 * np.std(x, ddof=1) / np.sqrt(len(x))
 
 
 def _bar_with_ci(summary, column, ylabel, title, filename, methods=None):
-    """Общий шаблон для бар-графиков "среднее + 95% ДИ" (задержка, сеть, обработка на узле).
-    methods — список внутренних ключей методов (из METHOD_LABELS) для отображения; None = все.
-    Позволяет строить график только по подмножеству стратегий — удобно, когда какие-то
-    из них сильно выбиваются по масштабу и "сжимают" остальные кривые/столбцы в незаметный диапазон."""
-    method_keys = methods or _METHOD_ORDER
-    strat_labels = [METHOD_LABELS[m] for m in method_keys]
-
-    plt.figure(figsize=(10, 6))
-    x_pos = np.arange(len(strat_labels))
-    means, errs = [], []
-    for key in method_keys:
-        vals = summary[summary.method == key][column].values
-        means.append(vals.mean())
-        errs.append(_ci95(vals))
-    plt.bar(x_pos, means, yerr=errs, capsize=5, color=[COLORS[s] for s in strat_labels])
-    plt.xticks(x_pos, strat_labels, rotation=45)
+    """Общий шаблон столбчатого графика "среднее значение + 95% ДИ" по стратегиям."""
+    method_keys = methods or _METHOD_ORDER                             # какие методы отображать
+    strat_labels = [METHOD_LABELS[m] for m in method_keys]                # их человекочитаемые имена
+    plt.figure(figsize=(10, 6))                                            # создаём новую фигуру
+    x_pos = np.arange(len(strat_labels))                                     # позиции столбцов по оси X
+    means, errs = [], []                                                        # накопители средних и погрешностей
+    for key in method_keys:                                                       # для каждого метода
+        vals = summary[summary.method == key][column].values                       # все значения метрики по прогонам
+        means.append(vals.mean())                                                     # среднее значение
+        errs.append(_ci95(vals))                                                        # доверительный интервал
+    plt.bar(x_pos, means, yerr=errs, capsize=5, color=[COLORS[s] for s in strat_labels])  # рисуем столбцы с усами ошибок
+    plt.xticks(x_pos, strat_labels, rotation=45)                                            # подписи оси X с наклоном
     plt.ylabel(ylabel)
     plt.title(title)
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI)
-    plt.close()
+    plt.tight_layout()                                                                        # убираем лишние поля
+    plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI)                                    # сохраняем в файл
+    plt.close()                                                                                   # закрываем фигуру (освобождаем память)
 
 
 def plot_mean_latency(summary, methods=None, filename="mean_latency.png"):
@@ -158,13 +124,13 @@ def plot_processing_time(summary, methods=None, filename="processing_time.png"):
                  "Время обработки на узле без учёта сети по стратегиям (95% ДИ)", filename, methods)
 
 
-def plot_sla_share(sla, methods=None, suffix="all"):  # не используется в main(), но поддерживает фильтр
-    """Доля запросов, обработанных в пределах SLA (200 мс), по стратегиям."""
-    methods = _resolve_methods(methods)
+def plot_sla_share(sla, methods=None, suffix="all"):
+    """Доля запросов, обработанных в пределах SLA, по стратегиям."""
+    methods = _resolve_methods(methods)                                     # проверяем и нормализуем список методов
     strategies = [METHOD_LABELS[m] for m in methods]
     plt.figure(figsize=(10, 6))
     x_pos = np.arange(len(strategies))
-    shares = [sla.loc[key, "k_under_sla"] / sla.loc[key, "n_total"] for key in methods]
+    shares = [sla.loc[key, "k_under_sla"] / sla.loc[key, "n_total"] for key in methods]  # доля успешных запросов
     plt.bar(x_pos, shares, color=[COLORS[s] for s in strategies])
     plt.xticks(x_pos, strategies, rotation=45)
     plt.ylabel("Доля запросов в пределах 200 мс")
@@ -175,15 +141,14 @@ def plot_sla_share(sla, methods=None, suffix="all"):  # не используе�
 
 
 def plot_latency_boxplot(summary, methods=None, filename="latency_boxplot.png"):
-    """Разброс среднего времени отклика по прогонам, сравнение стратегий (или подмножества)."""
+    """Разброс среднего времени отклика по прогонам (boxplot) — сравнение стратегий."""
     method_keys = methods or _METHOD_ORDER
     strat_labels = [METHOD_LABELS[m] for m in method_keys]
     df = _with_strategy_column(summary)
-    df = df[df["strategy"].isin(strat_labels)]
-
+    df = df[df["strategy"].isin(strat_labels)]                              # оставляем только выбранное подмножество
     plt.figure(figsize=(10, 6))
     sns.boxplot(data=df, x="strategy", y="mean_latency_ms", order=strat_labels,
-                hue="strategy", palette=COLORS, legend=False)
+                hue="strategy", palette=COLORS, legend=False)                    # рисуем боксплот по каждой стратегии
     plt.title("Разброс среднего времени отклика по прогонам")
     plt.ylabel("Среднее время отклика за прогон (мс)")
     plt.xticks(rotation=45)
@@ -193,83 +158,79 @@ def plot_latency_boxplot(summary, methods=None, filename="latency_boxplot.png"):
 
 
 def plot_node_usage(node_usage, methods=None, filename="node_usage.png"):
-    """Частота использования узлов (row_0..row_N, col_0..col_M) по стратегиям (или подмножеству).
-    Кластеры различаются цветовой гаммой (ROW — синие, COL — оранжевые оттенки),
-    ширина фигуры и вынос легенды за пределы графика подстраиваются под число узлов,
-    заданное в configs/config.yaml (nodes.n_row_nodes/n_col_nodes)."""
+    """Частота использования каждого конкретного узла по стратегиям."""
     method_keys = methods or _METHOD_ORDER
     strat_labels = [METHOD_LABELS[m] for m in method_keys]
     df = _with_strategy_column(node_usage)
     df = df[df["strategy"].isin(strat_labels)]
-    pivot = df.pivot(index="strategy", columns="node_id", values="count").fillna(0).reindex(strat_labels)
-    shares = pivot.div(pivot.sum(axis=1), axis=0)
+    pivot = df.pivot(index="strategy", columns="node_id", values="count").fillna(0).reindex(strat_labels)  # таблица метод x узел
+    shares = pivot.div(pivot.sum(axis=1), axis=0)                              # переводим счётчики в доли (по строкам)
 
-    def _sort_key(c):  # "row_0"/"col_1" -> сортировка по кластеру и номеру; "timeout" уходит в конец
+    def _sort_key(c):
+        """Ключ сортировки узлов: сначала по кластеру (row/col), затем по номеру."""
         parts = c.split("_")
         return (parts[0], int(parts[1])) if len(parts) > 1 and parts[1].isdigit() else ("zz", 0)
 
-    node_cols = sorted(shares.columns, key=_sort_key)
-    row_cols = [c for c in node_cols if c.startswith("row_")]
-    col_cols = [c for c in node_cols if c.startswith("col_")]
-    other_cols = [c for c in node_cols if c not in row_cols and c not in col_cols]
+    node_cols = sorted(shares.columns, key=_sort_key)                            # сортированный список всех узлов
+    row_cols = [c for c in node_cols if c.startswith("row_")]                       # только ROW-узлы
+    col_cols = [c for c in node_cols if c.startswith("col_")]                        # только COL-узлы
+    other_cols = [c for c in node_cols if c not in row_cols and c not in col_cols]     # прочие (например "timeout")
 
-    row_palette = sns.color_palette("Blues", max(len(row_cols), 1))[::-1]
-    col_palette = sns.color_palette("Oranges", max(len(col_cols), 1))[::-1]
-    other_palette = sns.color_palette("Greys", max(len(other_cols), 1))
+    row_palette = sns.color_palette("Blues", max(len(row_cols), 1))[::-1]                # синяя палитра для ROW
+    col_palette = sns.color_palette("Oranges", max(len(col_cols), 1))[::-1]                # оранжевая палитра для COL
+    other_palette = sns.color_palette("Greys", max(len(other_cols), 1))                      # серая палитра для прочих
     color_map = dict(list(zip(row_cols, row_palette)) + list(zip(col_cols, col_palette)) +
-                      list(zip(other_cols, other_palette)))
+                      list(zip(other_cols, other_palette)))                                    # объединяем все палитры в один словарь
 
-    x_pos = np.arange(len(strat_labels))
-    width = 0.8 / max(len(node_cols), 1)
-    fig_width = max(12, 1.1 * len(node_cols) + 6)      # авто-расширение под число узлов
+    x_pos = np.arange(len(strat_labels))                                                          # позиции групп столбцов
+    width = 0.8 / max(len(node_cols), 1)                                                            # ширина одного столбца
+    fig_width = max(12, 1.1 * len(node_cols) + 6)                                                     # автоматическая ширина фигуры
     plt.figure(figsize=(fig_width, 6))
-    for j, node_id in enumerate(node_cols):
+    for j, node_id in enumerate(node_cols):                                                             # для каждого узла — свой столбец
         plt.bar(x_pos + j * width, shares[node_id].values, width=width,
                 label=node_id, color=color_map[node_id])
-    plt.xticks(x_pos + width * (len(node_cols) - 1) / 2, strat_labels, rotation=45)
+    plt.xticks(x_pos + width * (len(node_cols) - 1) / 2, strat_labels, rotation=45)                        # подписи по центру групп
     plt.ylabel("Доля запросов, направленных на узел")
     plt.title("Частота использования узлов по стратегиям (ROW — синие, COL — оранжевые)")
-    plt.legend(title="Узел", ncol=min(len(node_cols), 6), bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.legend(title="Узел", ncol=min(len(node_cols), 6), bbox_to_anchor=(1.02, 1), loc="upper left")          # легенда за пределами графика
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI, bbox_inches="tight")
     plt.close()
 
 
 def plot_drift_adaptation(cfg, window=500, methods=None, filename="drift_adaptation.png"):
-    """Динамика задержки в течение эпизода с дрейфом IoT-нагрузки и деградацией узла (прогон #0,
-    указанное подмножество стратегий). Фон графика закрашен по стадиям нагрузки, зоны подписаны
-    короткими кодами (Тип 1, Тип 2, ...), расшифровка — отдельной легендой под графиком."""
+    """Динамика задержки в течение эпизода (скользящее среднее) для указанных стратегий."""
     method_keys = methods or _METHOD_ORDER
-    phases = np.load("results/trace_phases.npy", allow_pickle=True)
-    phase_codes, phase_colors, phase_descriptions = _build_phase_style(cfg)
+    phases = np.load("results/trace_phases.npy", allow_pickle=True)               # загружаем трассу фаз (прогон #0)
+    phase_codes, phase_colors, phase_descriptions = _build_phase_style(cfg)          # стили фаз
     fig, ax = plt.subplots(figsize=(14, 7))
-    for key in method_keys:
+    for key in method_keys:                                                            # рисуем кривую для каждой выбранной стратегии
         strat = METHOD_LABELS[key]
-        lat = np.load(f"results/trace_latency_{key}.npy")
-        rolling_mean = pd.Series(lat).rolling(window, min_periods=1).mean()
+        lat = np.load(f"results/trace_latency_{key}.npy")                                # трасса задержки этого метода
+        rolling_mean = pd.Series(lat).rolling(window, min_periods=1).mean()                 # скользящее среднее
         ax.plot(rolling_mean.index, rolling_mean, label=strat, linewidth=2, color=COLORS.get(strat), zorder=2)
 
-    _annotate_phase_zones(ax, phases, phase_codes, phase_colors)
+    _annotate_phase_zones(ax, phases, phase_codes, phase_colors)                          # закрашиваем фон по фазам
 
-    d = cfg["degradation"]
-    if d["enabled"]:
+    d = cfg["degradation"]                                                                   # секция деградации из конфига
+    if d["enabled"]:                                                                            # если основное событие деградации включено
         ax.axvspan(d["start_query"], d["end_query"], color="red", alpha=0.15,
-                   label=f"Деградация узла {d['engine']}#{d['node_idx']}", zorder=1)
+                   label=f"Деградация узла {d['engine']}#{d['node_idx']}", zorder=1)              # красная зона деградации
 
-    ax.set_title(f"Динамика задержки при дрейфе нагрузки (окно {window} запросов)", pad=45)
+    ax.set_title(f"Динамика задержки при дрейфе нагрузки (окно {window} запросов)", pad=45)          # заголовок с отступом
     ax.set_xlabel("Номер запроса в эпизоде")
     ax.set_ylabel("Задержка, мс (скользящее среднее)")
-    strat_legend = ax.legend(ncol=2, fontsize=9, loc="upper left")
-    ax.add_artist(strat_legend)   # закрепляем легенду стратегий, чтобы её не убрал следующий вызов legend()
-    _add_phase_code_legend(ax, phase_codes, phase_descriptions, phase_colors)
-    ax.grid(True, zorder=0)
+    strat_legend = ax.legend(ncol=2, fontsize=9, loc="upper left")                                     # легенда стратегий
+    ax.add_artist(strat_legend)                                                                            # закрепляем её (не удалять при следующем legend())
+    _add_phase_code_legend(ax, phase_codes, phase_descriptions, phase_colors)                                # легенда расшифровки фаз
+    ax.grid(True, zorder=0)                                                                                    # сетка на фоне
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI, bbox_inches="tight")
     plt.close()
 
 
 def plot_reward_dynamics(cfg, window=500, methods=None, filename="reward_dynamics.png"):
-    """Динамика мгновенной награды указанного подмножества методов в течение эпизода (прогон #0)."""
+    """Динамика мгновенной награды в течение эпизода — аналог plot_drift_adaptation, но для reward."""
     method_keys = methods or _METHOD_ORDER
     phases = np.load("results/trace_phases.npy", allow_pickle=True)
     phase_codes, phase_colors, phase_descriptions = _build_phase_style(cfg)
@@ -300,11 +261,8 @@ def plot_reward_dynamics(cfg, window=500, methods=None, filename="reward_dynamic
 
 
 def plot_epsilon_curve(cfg):
-    """Динамика epsilon (интенсивности разведки) RL-агента в течение эпизода (прогон #0):
-    затухание eps_start -> eps_base за eps_decay_steps шагов и всплески при обнаружении
-    дрейфа нагрузки (eps_drift). Определена только для rl_dqn (остальные методы либо не
-    используют epsilon-разведку, либо используют Thompson sampling без явного epsilon)."""
-    eps = np.load("results/trace_epsilon_rl_dqn.npy")
+    """Динамика эпсилон (интенсивности разведки) RL-агента в течение эпизода."""
+    eps = np.load("results/trace_epsilon_rl_dqn.npy")                              # трасса эпсилон (только для rl_dqn)
     phases = np.load("results/trace_phases.npy", allow_pickle=True)
     phase_codes, phase_colors, phase_descriptions = _build_phase_style(cfg)
     fig, ax = plt.subplots(figsize=(14, 6))
@@ -330,35 +288,31 @@ def plot_epsilon_curve(cfg):
 
 
 def main():
-    cfg = yaml.safe_load(open("configs/config.yaml", encoding="utf-8"))
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    summary = pd.read_csv("results/episode_summary.csv")
-    sla = pd.read_csv("results/sla_counts.csv").set_index("method")
-    node_usage = pd.read_csv("results/node_usage.csv")
+    """Точка входа: строит все графики для всех подмножеств стратегий, заданных в конфиге."""
+    cfg = yaml.safe_load(open("configs/config.yaml", encoding="utf-8"))               # загружаем конфиг
+    os.makedirs(OUTPUT_DIR, exist_ok=True)                                               # создаём папку для графиков
+    summary = pd.read_csv("results/episode_summary.csv")                                  # читаем итоговые метрики
+    sla = pd.read_csv("results/sla_counts.csv").set_index("method")                          # читаем счётчики SLA
+    node_usage = pd.read_csv("results/node_usage.csv")                                          # читаем частоту использования узлов
 
-    # Именованные подмножества стратегий из configs/config.yaml -> plots.subsets.
-    # Позволяет строить один и тот же набор графиков для разных комбинаций стратегий —
-    # удобно, когда какие-то методы сильно выбиваются по масштабу и "сжимают" остальные
-    # кривые/столбцы. Подмножество "all" (или отсутствие секции plots в конфиге) сохраняет
-    # старые имена файлов без суффикса; остальные подмножества получают суффикс _<имя>.
-    subsets = cfg.get("plots", {}).get("subsets") or {"all": list(_METHOD_ORDER)}
-    for subset_name, methods in subsets.items():
-        methods = [m for m in methods if m in _METHOD_ORDER]   # защита от опечаток в конфиге
+    subsets = cfg.get("plots", {}).get("subsets") or {"all": list(_METHOD_ORDER)}                 # подмножества стратегий из конфига
+    for subset_name, methods in subsets.items():                                                    # для каждого именованного подмножества
+        methods = [m for m in methods if m in _METHOD_ORDER]                                            # защита от опечаток в конфиге
         if not methods:
             print(f"Подмножество '{subset_name}' пустое или содержит неизвестные методы — пропущено")
             continue
-        suffix = "" if subset_name == "all" else f"_{subset_name}"
+        suffix = "" if subset_name == "all" else f"_{subset_name}"                                        # суффикс имени файла
 
-        plot_mean_latency(summary, methods=methods, filename=f"mean_latency{suffix}.png")
-        plot_latency_boxplot(summary, methods=methods, filename=f"latency_boxplot{suffix}.png")
+        plot_mean_latency(summary, methods=methods, filename=f"mean_latency{suffix}.png")                   # строим все графики
+        plot_latency_boxplot(summary, methods=methods, filename=f"latency_boxplot{suffix}.png")               # для этого подмножества
         plot_network_latency(summary, methods=methods, filename=f"network_latency{suffix}.png")
         plot_processing_time(summary, methods=methods, filename=f"processing_time{suffix}.png")
         plot_node_usage(node_usage, methods=methods, filename=f"node_usage{suffix}.png")
         plot_drift_adaptation(cfg, methods=methods, filename=f"drift_adaptation{suffix}.png")
         plot_reward_dynamics(cfg, methods=methods, filename=f"reward_dynamics{suffix}.png")
 
-    plot_sla_share(sla)     # не используется в проверке гипотезы; подмножества не применяются
-    plot_epsilon_curve(cfg)  # определён только для rl_dqn, подмножества методов не применимы
+    plot_sla_share(sla)                                                                                        # SLA-график всегда для всех методов
+    plot_epsilon_curve(cfg)                                                                                       # epsilon-график только для rl_dqn
     print(f"Графики сохранены в {OUTPUT_DIR}/")
 
 

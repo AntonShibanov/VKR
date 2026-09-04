@@ -1,0 +1,21 @@
+# Mac OS
+.DS_Store
+
+# Python
+__pycache__
+.venv
+venv
+
+# IDE
+.vscode
+
+# env
+.env
+
+# app
+.embeddings_cache
+
+# logs
+.csv
+.png
+.npy
