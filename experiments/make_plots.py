@@ -9,6 +9,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import yaml
+from scipy import stats as sps
 from src.workload import DEFAULT_PHASES
 
 OUTPUT_DIR = "results/figures"                                    # папка, куда сохраняются все графики
@@ -286,6 +287,63 @@ def plot_epsilon_curve(cfg):
     plt.savefig(os.path.join(OUTPUT_DIR, "epsilon_curve.png"), dpi=DPI, bbox_inches="tight")
     plt.close()
 
+def plot_latency_distribution(methods=None, filename="latency_distribution.png", bins=80):
+    """
+    Эмпирическое распределение задержки (прогон #0) для каждой стратегии — гистограмма
+    плотности + подобранная НОРМАЛЬНАЯ кривая с тем же средним/std, наложенная для
+    сравнения. Демонстрирует, что P95/P99 — это перцентили НАБЛЮДАЕМОГО распределения,
+    а не хвосты симметричного гауссиана: латентность в этой среде правоскошена по
+    построению (множитель self.rng.lognormal(...) в environment.py), поэтому нормальная
+    аппроксимация заметно НЕДООЦЕНИВАЕТ длину правого хвоста — на графике это видно как
+    систематическое расхождение гистограммы и дашированной кривой именно в области
+    P95/P99 (отмечены вертикальными линиями).
+
+    Каждая стратегия — отдельная панель (subplot), т.к. масштабы задержки различаются
+    в разы между "слепыми" эвристиками и "умными" методами.
+    """
+    method_keys = methods or _METHOD_ORDER
+    n = len(method_keys)
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for ax, key in zip(axes_flat, method_keys):
+        strat = METHOD_LABELS[key]
+        lat = np.load(f"results/trace_latency_{key}.npy")
+
+        mu, sigma = lat.mean(), lat.std(ddof=1)
+        skewness = float(sps.skew(lat))   # 0 = симметрично (норма); >0 = "тяжёлый" правый хвост
+
+        # эмпирическая плотность (гистограмма, нормированная на площадь = 1)
+        ax.hist(lat, bins=bins, density=True, color=COLORS.get(strat), alpha=0.55,
+                edgecolor="white", linewidth=0.3, label="Наблюдаемое распределение")
+
+        # подобранная нормальная кривая с тем же mu/sigma — ТОЛЬКО для сравнения;
+        # не предполагается, что она хорошо описывает данные (см. skewness в заголовке)
+        x_grid = np.linspace(lat.min(), np.percentile(lat, 99.9), 400)
+        ax.plot(x_grid, sps.norm.pdf(x_grid, mu, sigma), color="black", ls="--", lw=1.5,
+                label=f"Норм. аппроксимация N({mu:.1f}, {sigma:.1f}²)")
+
+        p50, p95, p99 = np.percentile(lat, [50, 95, 99])
+        for p, label, ls in [(p50, "P50", ":"), (p95, "P95", "--"), (p99, "P99", "-")]:
+            ax.axvline(p, color="firebrick", ls=ls, lw=1.2)
+            ax.text(p, ax.get_ylim()[1] * 0.95, label, color="firebrick", fontsize=8,
+                    ha="left", va="top", rotation=90)
+
+        ax.set_title(f"{strat}\nskewness = {skewness:.2f} (0 = норм.распределение)", fontsize=10)
+        ax.set_xlabel("Задержка, мс")
+        ax.set_ylabel("Плотность")
+        ax.legend(fontsize=7, loc="upper right")
+
+    for ax in axes_flat[len(method_keys):]:      # скрываем пустые ячейки сетки, если методов < nrows*ncols
+        ax.axis("off")
+
+    fig.suptitle("Эмпирическое распределение задержки vs нормальная аппроксимация "
+                  "(вертикальные линии — P50/P95/P99 наблюдаемых данных)", fontsize=12)
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI, bbox_inches="tight")
+    plt.close()
 
 def main():
     """Точка входа: строит все графики для всех подмножеств стратегий, заданных в конфиге."""
@@ -310,6 +368,7 @@ def main():
         plot_node_usage(node_usage, methods=methods, filename=f"node_usage{suffix}.png")
         plot_drift_adaptation(cfg, methods=methods, filename=f"drift_adaptation{suffix}.png")
         plot_reward_dynamics(cfg, methods=methods, filename=f"reward_dynamics{suffix}.png")
+        plot_latency_distribution(methods=list(_METHOD_ORDER), filename="latency_distribution.png")
 
     plot_sla_share(sla)                                                                                        # SLA-график всегда для всех методов
     plot_epsilon_curve(cfg)                                                                                       # epsilon-график только для rl_dqn

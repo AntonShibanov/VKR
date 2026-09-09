@@ -60,7 +60,7 @@ def main():
     p95_effect = paired_effect_size(p95_lat["rl_dqn"], p95_lat[best_baseline])               # эффект RL против лучшего по P95
     n_p95 = required_n_paired(p95_effect)                                                     # требуемое n для этого сравнения
 
-    n_final = int(np.clip(max(n_mean, n_p95), 20, 40))                                          # итоговое n, ограниченное диапазоном 20..40
+    n_final = int(np.clip(max(n_mean, n_p95), 20, 30))                                          # итоговое n, ограниченное диапазоном 20..30
 
     print(f"Среднее время отклика: наихудший бейзлайн '{worst_baseline}', "
           f"d={mean_effects[worst_baseline]:.2f} -> n={n_mean}")                                    # диагностический вывод
