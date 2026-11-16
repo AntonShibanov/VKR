@@ -30,3 +30,10 @@ python -m experiments.analyze_results
 python -m experiments.make_plots
 ```
 Графики сохраняются в папку results/figures
+
+5. Построение сравнительных таблиц
+
+```bash
+python -m experiments.build_presentation_tables
+```
+Таблицы сохраняются в папку results/tables
