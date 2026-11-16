@@ -37,6 +37,15 @@ def main():
         })
 
     # --- условие (2): доля катастрофических решений — только против "умных" методов ---
+    # ВАЖНО: используется ИСХОДНОЕ (самоотносительное, 10x СОБСТВЕННОЙ медианы
+    # метода) определение catastrophic_rate -- формулировка условия (2) была
+    # зафиксирована ДО того, как diagnose_catastrophic_queue_health.py выявил
+    # методологическую особенность этого определения (при разной типичной
+    # latency методов порог "катастрофы" у них неодинаков в абсолютных мс --
+    # см. catastrophic_rate_abs ниже). Критерий подтверждения condition (2)
+    # НЕ меняется задним числом под результат -- вместо этого ниже отдельно
+    # (как диагностика, confirmed=None) добавлена абсолютная версия метрики
+    # для прозрачного обсуждения этого эффекта в тексте работы.
     for base in SMART_BASELINES:                                                          # только против одношаговых адаптивных методов
         ci = bootstrap_reduction_ci(_series(summary, RL, "catastrophic_rate"),
                                      _series(summary, base, "catastrophic_rate"),
@@ -59,6 +68,29 @@ def main():
             "ci_low": round(ci["ci_low"], 3), "ci_high": round(ci["ci_high"], 3),
             "threshold": None, "p_value": round(ci["p_value"], 4), "confirmed": None,           # confirmed=None: не проверяем условие
         })
+
+    # --- НОВОЕ: диагностика catastrophic_rate_abs (единый для всех методов
+    # порог "катастрофы", см. src/metrics.py::CATASTROPHIC_ABS_THRESHOLD_MS) --
+    # только против "умных" методов, по аналогии с основным условием (2),
+    # чтобы оба определения были сопоставимы бок о бок в итоговой таблице.
+    # Требует, чтобы episode_summary.csv содержал колонку catastrophic_rate_abs
+    # (появляется автоматически после правки src/metrics.py -- проверено,
+    # что run_experiment.py не требует отдельных изменений).
+    if "catastrophic_rate_abs" in summary.columns:
+        for base in SMART_BASELINES:
+            ci = bootstrap_reduction_ci(_series(summary, RL, "catastrophic_rate_abs"),
+                                         _series(summary, base, "catastrophic_rate_abs"),
+                                         threshold=0.0)
+            rows.append({
+                "metric": "catastrophic_rate_abs_diagnostic", "baseline": base,
+                "reduction_mean": round(ci["reduction_mean"], 3),
+                "ci_low": round(ci["ci_low"], 3), "ci_high": round(ci["ci_high"], 3),
+                "threshold": None, "p_value": round(ci["p_value"], 4), "confirmed": None,
+            })
+    else:
+        print("[предупреждение] колонка catastrophic_rate_abs отсутствует в "
+              "episode_summary.csv -- пропускаю диагностику (убедитесь, что "
+              "src/metrics.py обновлён и run_experiment.py был перезапущен)")
 
     out = pd.DataFrame(rows)                                                                       # собираем таблицу из всех строк
     out.to_csv("results/hypothesis_test.csv", index=False)                                            # сохраняем результат в CSV

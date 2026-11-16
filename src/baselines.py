@@ -31,3 +31,14 @@ class CostThresholdRouter:
         if COL not in valid_actions:                             # если COL недопустим (строгая согласованность)
             return ROW
         return COL if query.cost > self.threshold else ROW        # дорогие запросы — в COL, дешёвые — в ROW
+
+class AllColRouter:
+    """Диагностический бейзлайн: всегда COL, если допустимо; иначе ROW.
+    Используется для проверки гипотезы, что контекстуальный бандит (LinTS)
+    после интенсификации сценария (нелинейная очередь + стохастическая
+    деградация) фактически сошёлся к вырожденной политике "почти всегда
+    COL", а не к содержательно нетривиальному правилу, зависящему от
+    состояния. Если метрики AllColRouter близки к bandit_lints — гипотеза
+    подтверждена."""
+    def route(self, query, env, valid_actions):
+        return COL if COL in valid_actions else ROW

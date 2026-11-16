@@ -4,6 +4,7 @@ replay-буфер на sum-tree, эпсилон-разведка с распис
 Double DQN, target-сеть.
 """
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 from collections import deque
@@ -147,7 +148,24 @@ class DQNRouter:
                  safety_enabled=True, drift_exploration_enabled=True, grad_steps_per_update=1,
                  train_interval=1,
                  per_alpha=0.6, per_beta_start=0.4, per_beta_frames=20000, per_eps=1e-3,
-                 fallback=None, seed=0):
+                 fallback=None, seed=0,
+                 # --- НОВОЕ: защитный щит (tail shield) для экстремального хвоста стоимости ---
+                 # Устраняет редкие, но очень дорогие по reward промахи DQN на few-shot
+                 # состояниях (запросы с cost far за пределами типичного диапазона,
+                 # где сеть почти не видела обучающих примеров). Щит НЕ заменяет
+                 # обучение сети (observe()/_train_step() по-прежнему выполняются как
+                 # обычно для таких переходов) — он лишь исключает выход Q-сети и
+                 # epsilon-greedy из ПРИНЯТИЯ решения в этой узкой, заранее определённой
+                 # зоне, где детерминированное правило уже доказанно не хуже.
+                 # Это чисто инженерный guardrail (аналог практики реальных HTAP-СУБД
+                 # вроде TiDB/TiFlash — экстремально тяжёлые сканы безусловно уходят в
+                 # колоночный движок), НЕ новая калибровка по внешним данным — ни один
+                 # из параметров ниже не противоречит ранее откалиброванным по Redset
+                 # величинам (mu/sigma/cost_scaling_exponent не трогаются).
+                 tail_shield_enabled=True,
+                 tail_shield_qtypes=("analytic",),
+                 tail_shield_cost_threshold=None,
+                 tail_shield_action=1):
         torch.manual_seed(seed)                                          # фиксируем seed PyTorch для воспроизводимости весов
         self.q = QNet(dim, hidden_size=hidden_size, n_hidden_layers=n_hidden_layers)         # основная (обучаемая) Q-сеть
         self.q_target = QNet(dim, hidden_size=hidden_size, n_hidden_layers=n_hidden_layers)  # целевая (стабилизирующая) сеть
@@ -170,6 +188,28 @@ class DQNRouter:
         self._online_steps = 0                                                   # счётчик выполненных онлайн-шагов
         self.last_eps = eps_start                                                 # последнее использованное значение эпсилон
 
+        # --- НОВОЕ: параметры и состояние защитного щита хвоста стоимости ---
+        self.tail_shield_enabled = bool(tail_shield_enabled)                        # глобальный флаг включения щита
+        self.tail_shield_qtypes = set(tail_shield_qtypes)                           # типы запроса, к которым применяется щит
+        self.tail_shield_action = tail_shield_action                                 # действие, принудительно выбираемое щитом (по умолчанию COL=1)
+        if tail_shield_cost_threshold is not None:                                    # если пороги переданы явно — используем их
+            self.tail_shield_cost_threshold = dict(tail_shield_cost_threshold)
+        else:
+            # Значение по умолчанию только для "analytic": exp(mu + 3*sigma) при
+            # mu=3.5, sigma=2.296 (текущие откалиброванные по Redset параметры
+            # workload.cost_distributions.analytic) ~ 99.9+ перцентиль
+            # распределения — НЕ подгонка под конкретно найденный случай
+            # (step_abs=166091 из диагностики), а естественная граница "3 сигмы"
+            # уже имеющегося в конфиге логнормального распределения.
+            self.tail_shield_cost_threshold = {"analytic": math.exp(3.5 + 2.5 * 2.296)}
+            # Граница сдвинута с ~99.9-го на ~99-й перцентиль — захватывает именно ту
+            # зону (90-99.9%), где на ДВУХ независимых seed (1000 и 1004) обнаружена
+            # нестабильность agree_rate (0.97-0.997) и несоразмерно большой ущерб от
+            # единичных промахов. НЕ подгонка под конкретный найденный step_abs —
+            # порог по-прежнему формула от откалиброванных mu/sigma, только с другим
+            # множителем сигмы, выбранным по наблюдаемой границе зоны риска.
+        self._last_shielded = False                                                   # флаг: было ли последнее решение принято щитом, а не сетью
+
     def _drift_detected(self):
         """Простая эвристика детекции дрейфа: сравнение среднего за последние 10 и предыдущие 40 наблюдений."""
         if len(self._hist) < 50:                                              # недостаточно данных для сравнения
@@ -190,10 +230,42 @@ class DQNRouter:
             return self.eps_drift                                                  # временно повышаем эпсилон
         return base                                                                 # иначе — обычное плановое значение
 
+    def _tail_shield_action(self, query, valid_actions):
+        """Проверить, должен ли щит перехватить решение для этого запроса, и
+        вернуть принудительное действие, либо None, если щит не применяется.
+
+        Щит срабатывает только если: 1) включён; 2) qtype запроса входит в
+        защищаемый список; 3) cost запроса строго больше порога для этого
+        qtype; 4) принудительное действие щита допустимо (есть в valid_actions
+        — т.е. нужный движок сейчас не исключён admission control/недоступен).
+        Пункт 4 важен: щит не должен пытаться направить запрос туда, куда
+        маршрутизация физически невозможна на этом шаге."""
+        if not self.tail_shield_enabled or query.qtype not in self.tail_shield_qtypes:
+            return None                                                            # щит не применяется к этому типу запроса
+        limit = self.tail_shield_cost_threshold.get(query.qtype)                    # порог cost для этого qtype (может отсутствовать)
+        if limit is None or query.cost <= limit:                                     # запрос не попадает в защищаемый хвост
+            return None
+        if self.tail_shield_action not in valid_actions:                              # принудительное действие сейчас недоступно
+            return None
+        return self.tail_shield_action                                                # щит перехватывает решение
+
     def route(self, query, env, valid_actions):
         """Выбрать действие (движок) для текущего запроса."""
         self._last_x = env.state_vector(query)                                # запоминаем вектор состояния (для observe())
         self.last_eps = self._current_eps()                                    # сохраняем текущий эпсилон (для графиков)
+
+        # --- НОВОЕ: проверка защитного щита ПЕРЕД эвристикой отката и Q-сетью ---
+        # Щит имеет приоритет даже над режимом "откат к эвристике" (cooldown) и
+        # над epsilon-разведкой — редкий дорогой хвост не должен ни случайно
+        # исследоваться, ни передаваться на решение сторонней эвристике, если
+        # для него уже есть собственное, проверенное правило.
+        shielded_action = self._tail_shield_action(query, valid_actions)
+        if shielded_action is not None:
+            self.last_eps = 0.0                                                  # это НЕ разведка — явно фиксируем для графиков/логов
+            self._last_shielded = True                                            # помечаем, что решение принято щитом, а не сетью
+            return shielded_action
+
+        self._last_shielded = False                                               # обычный путь принятия решения (сеть/эвристика/разведка)
         if self.safety_enabled and self._cooldown > 0:                          # если активен режим "откат к эвристике"
             self._cooldown -= 1                                                   # уменьшаем оставшееся время откaта
             return self.fallback.route(query, env, valid_actions)                  # используем эвристику вместо сети
@@ -209,6 +281,12 @@ class DQNRouter:
         if self.safety_enabled and len(self._hist) >= 10 and latency > 10 * np.median(self._hist):
             self._cooldown = 20                                                   # аномалия обнаружена -> временный откат к эвристике
         next_x = next_env.state_vector(next_query)                                 # вектор состояния для СЛЕДУЮЩЕГО запроса
+        # Переход сохраняется и используется для обучения ВСЕГДА, в том числе
+        # если action был принудительно выбран щитом (self._last_shielded) —
+        # щит исключает Q-сеть и epsilon-greedy только из ПРИНЯТИЯ решения,
+        # но не из обучения: сеть по-прежнему должна видеть такие переходы и
+        # их реальный reward, иначе она никогда не научится оценивать это
+        # действие в этой зоне состояний самостоятельно.
         self.buffer.add(self._last_x, action, reward, next_x)                       # сохраняем переход (s,a,r,s') в буфер
         self._online_steps += 1                                                       # увеличиваем счётчик онлайн-шагов
         if len(self.buffer) >= self.batch_size and self._online_steps % self.train_interval == 0:

@@ -24,6 +24,7 @@ STRATEGIES = [METHOD_LABELS[m] for m in _METHOD_ORDER]                  # спи
 COLORS = dict(zip(STRATEGIES, sns.color_palette("tab10", len(STRATEGIES))))  # фиксированный цвет на каждую стратегию
 
 MIN_PHASE_LABEL_FRACTION = 0.02                                          # минимальная доля эпизода, чтобы подпись фазы рисовалась
+OUTLIER_RUN_MULTIPLIER = 2.0                                                # более 2 от нормы
 
 
 def _resolve_methods(methods):
@@ -90,7 +91,7 @@ def _ci95(x):
     return 1.96 * np.std(x, ddof=1) / np.sqrt(len(x))
 
 
-def _bar_with_ci(summary, column, ylabel, title, filename, methods=None):
+def _bar_with_ci(summary, column, ylabel, title, filename, methods=None, log_scale=False):
     """Общий шаблон столбчатого графика "среднее значение + 95% ДИ" по стратегиям."""
     method_keys = methods or _METHOD_ORDER                             # какие методы отображать
     strat_labels = [METHOD_LABELS[m] for m in method_keys]                # их человекочитаемые имена
@@ -103,6 +104,11 @@ def _bar_with_ci(summary, column, ylabel, title, filename, methods=None):
         errs.append(_ci95(vals))                                                        # доверительный интервал
     plt.bar(x_pos, means, yerr=errs, capsize=5, color=[COLORS[s] for s in strat_labels])  # рисуем столбцы с усами ошибок
     plt.xticks(x_pos, strat_labels, rotation=45)                                            # подписи оси X с наклоном
+    if log_scale:                                                         # НОВОЕ
+        plt.yscale("log")
+        plt.gca().yaxis.set_major_formatter(plt.ScalarFormatter())          # обычные числа вместо 10^x
+        ylabel = f"{ylabel} (лог. шкала)"
+
     plt.ylabel(ylabel)
     plt.title(title)
     plt.tight_layout()                                                                        # убираем лишние поля
@@ -110,9 +116,9 @@ def _bar_with_ci(summary, column, ylabel, title, filename, methods=None):
     plt.close()                                                                                   # закрываем фигуру (освобождаем память)
 
 
-def plot_mean_latency(summary, methods=None, filename="mean_latency.png"):
+def plot_mean_latency(summary, methods=None, filename="mean_latency.png", log_scale=False):
     _bar_with_ci(summary, "mean_latency_ms", "Среднее время отклика (мс)",
-                 "Сравнение стратегий по среднему времени отклика (95% ДИ)", filename, methods)
+                 "Сравнение стратегий по среднему времени отклика (95% ДИ)", filename, methods, log_scale=log_scale)
 
 
 def plot_network_latency(summary, methods=None, filename="network_latency.png"):
@@ -141,7 +147,7 @@ def plot_sla_share(sla, methods=None, suffix="all"):
     plt.close()
 
 
-def plot_latency_boxplot(summary, methods=None, filename="latency_boxplot.png"):
+def plot_latency_boxplot(summary, methods=None, filename="latency_boxplot.png", log_scale=False):
     """Разброс среднего времени отклика по прогонам (boxplot) — сравнение стратегий."""
     method_keys = methods or _METHOD_ORDER
     strat_labels = [METHOD_LABELS[m] for m in method_keys]
@@ -151,8 +157,42 @@ def plot_latency_boxplot(summary, methods=None, filename="latency_boxplot.png"):
     sns.boxplot(data=df, x="strategy", y="mean_latency_ms", order=strat_labels,
                 hue="strategy", palette=COLORS, legend=False)                    # рисуем боксплот по каждой стратегии
     plt.title("Разброс среднего времени отклика по прогонам")
-    plt.ylabel("Среднее время отклика за прогон (мс)")
+    ylabel = "Среднее время отклика за прогон (мс)"
+    if log_scale:
+        plt.yscale("log")
+        plt.gca().yaxis.set_major_formatter(plt.ScalarFormatter())
+        ylabel += " (лог. шкала)"
+    plt.ylabel(ylabel)
     plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI)
+    plt.close()
+
+def plot_catastrophic_outlier_runs(summary, methods=None, filename="catastrophic_outlier_runs.png"):
+    """Столбчатая диаграмма устойчивости: число прогонов (из N), где mean_latency_ms
+    конкретного прогона превысила OUTLIER_RUN_MULTIPLIER x медиану ЭТОГО ЖЕ метода
+    по всем его прогонам ("норма" берётся индивидуально для каждого метода).
+    Над каждым столбцом подписан коэффициент вариации (CV) среднего времени отклика
+    по прогонам — соответствует Таблице В "Устойчивость методов по прогонам"."""
+    method_keys = methods or _METHOD_ORDER                                   # какие методы отображать
+    strat_labels = [METHOD_LABELS[m] for m in method_keys]                      # их человекочитаемые имена
+    counts, cvs = [], []                                                           # накопители числа выбросов и CV
+    for key in method_keys:                                                          # для каждого метода
+        vals = summary.loc[summary.method == key, "mean_latency_ms"].values            # все значения по прогонам
+        median = np.median(vals)                                                         # "норма" — медиана метода
+        counts.append(int((vals > OUTLIER_RUN_MULTIPLIER * median).sum()))                 # число прогонов-выбросов
+        cvs.append(100 * vals.std(ddof=1) / vals.mean())                                     # коэффициент вариации, %
+
+    plt.figure(figsize=(10, 6))
+    x_pos = np.arange(len(strat_labels))
+    bars = plt.bar(x_pos, counts, color=[COLORS[s] for s in strat_labels])             # столбцы числа выбросов
+    for bar, cv in zip(bars, cvs):                                                        # подписываем CV над каждым столбцом
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
+                 f"CV={cv:.1f}%", ha="center", va="bottom", fontsize=8)
+    plt.xticks(x_pos, strat_labels, rotation=45)
+    plt.ylabel(f"Число прогонов с выбросом (> {OUTLIER_RUN_MULTIPLIER:.0f}x от нормы), "
+               f"из {summary.run_id.nunique()}")
+    plt.title("Устойчивость методов: частота катастрофических прогонов")
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=DPI)
     plt.close()
@@ -361,8 +401,10 @@ def main():
             continue
         suffix = "" if subset_name == "all" else f"_{subset_name}"                                        # суффикс имени файла
 
-        plot_mean_latency(summary, methods=methods, filename=f"mean_latency{suffix}.png")                   # строим все графики
-        plot_latency_boxplot(summary, methods=methods, filename=f"latency_boxplot{suffix}.png")               # для этого подмножества
+        #plot_mean_latency(summary, methods=methods, filename=f"mean_latency{suffix}.png")                   # строим все графики
+        #plot_latency_boxplot(summary, methods=methods, filename=f"latency_boxplot{suffix}.png")               # для этого подмножества
+        plot_mean_latency(summary, methods=list(_METHOD_ORDER), filename="mean_latency_log.png", log_scale=True)
+        plot_latency_boxplot(summary, methods=list(_METHOD_ORDER), filename="latency_boxplot_log.png", log_scale=True)
         plot_network_latency(summary, methods=methods, filename=f"network_latency{suffix}.png")
         plot_processing_time(summary, methods=methods, filename=f"processing_time{suffix}.png")
         plot_node_usage(node_usage, methods=methods, filename=f"node_usage{suffix}.png")
@@ -371,6 +413,7 @@ def main():
         plot_latency_distribution(methods=list(_METHOD_ORDER), filename="latency_distribution.png")
 
     plot_sla_share(sla)                                                                                        # SLA-график всегда для всех методов
+    plot_catastrophic_outlier_runs(summary)                                                                     # устойчивость по прогонам, все методы
     plot_epsilon_curve(cfg)                                                                                       # epsilon-график только для rl_dqn
     print(f"Графики сохранены в {OUTPUT_DIR}/")
 

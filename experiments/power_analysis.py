@@ -1,4 +1,5 @@
 """
+power_analysis.py
 Пилотный прогон для оценки требуемого числа полных прогонов
 (n_runs), обеспечивающего заданную статистическую мощность.
 """
@@ -20,15 +21,21 @@ def pilot_samples(cfg, seed0):
     p95_lat = {m: [] for m in BASELINES + ["rl_dqn"]}                        # накопитель P95-задержки по методам
     for i in range(N_PILOT):                                                  # для каждого пилотного прогона
         seed = seed0 + i                                                         # уникальный seed
-        offline_q, _ = WorkloadGenerator(cfg["offline"]["n_offline_queries"], seed=seed,
-                                          drift_enabled=False).generate()          # офлайн-запросы для этого seed
+        offline_q, _ = WorkloadGenerator(
+            cfg["offline"]["n_offline_queries"],
+            seed=seed,
+            drift_enabled=False,
+            phases=cfg["workload"]["phases"],
+            cost_distributions=cfg["workload"]["cost_distributions"],
+        ).generate()          # офлайн-запросы для этого seed
         trans = build_oracle_log(offline_q, seed=seed, env_kwargs=cfg["nodes"])       # оракульный лог для RL
         bandit_log = build_bandit_log(offline_q, seed=seed, env_kwargs=cfg["nodes"],
                                        bandit_alpha=cfg["bandit"]["alpha"])              # лог бандита для GBM
         routers = make_routers(cfg, trans, bandit_log, seed)                              # создаём все стратегии
         for name, router in routers.items():                                                # для каждой стратегии
             online = name in {"bandit_lints", "rl_dqn"}                                       # дообучается ли метод онлайн
-            lat, *_ = run_episode(router, seed, cfg, online_learn=online)                       # прогоняем эпизод
+            lat, *_ = run_episode(router, seed, cfg, online_learn=online,
+                       warmup_queries=cfg["workload"].get("warmup_queries", 0))                       # прогоняем эпизод
             mean_lat[name].append(np.mean(lat))                                                   # средняя задержка этого прогона
             p95_lat[name].append(np.percentile(lat, 95))                                            # P95-задержка этого прогона
     return {k: np.array(v) for k, v in mean_lat.items()}, {k: np.array(v) for k, v in p95_lat.items()}  # переводим в numpy

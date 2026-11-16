@@ -25,3 +25,4 @@ class LinTSRouter:
         x = env.state_vector(query)                                          # признаки запроса на момент выполнения
         self.A[action] += np.outer(x, x)                                      # обновляем матрицу A для выбранного действия
         self.b[action] += reward * x                                          # обновляем накопленный вектор наблюдений
+
